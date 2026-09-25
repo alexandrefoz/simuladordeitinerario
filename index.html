@@ -733,6 +733,14 @@
     return { added, dupes, errors: parsed.errors, skippedNonPoint: parsed.skippedNonPoint };
   }
 
+  // exact match only - originPoint/destPoint get set to an imported point's own {lat,lon} when
+  // picked via its popup buttons or the search box, so this reliably recognizes "this search
+  // endpoint IS an imported point" without needing to thread extra state through setOrigin/setDest
+  function findImportedPointAt(lat, lon){
+    if (lat == null || lon == null) return null;
+    return importedPoints.find(p => p.lat === lat && p.lon === lon) || null;
+  }
+
   document.getElementById('kmlImportBtn').addEventListener('click', () => {
     document.getElementById('kmlFileInput').click();
   });
@@ -1008,6 +1016,68 @@
     }
     return best;
   }
+  function nearestShapeIndexBounded(shapeId, lat, lon, minIdx, maxIdx){
+    const pts = shapes[shapeId];
+    if (!pts) return minIdx;
+    let best=minIdx, bestD=Infinity;
+    for (let i=minIdx;i<=maxIdx;i++){
+      const d = haversine(lat,lon,pts[i][0],pts[i][1]);
+      if (d<bestD){ bestD=d; best=i; }
+    }
+    return best;
+  }
+
+  // an imported point can be a real stop the operator's GTFS export just doesn't include (this is
+  // exactly what happened with the source data here - see the app's closing notes) - so if a
+  // trip's actual driven path (shape) comes within INFORMAL_STOP_MAX_M of one, it's fair to offer
+  // boarding/alighting there instead of forcing a longer walk to the nearest OFFICIALLY-listed
+  // stop. The search space is bounded to this ONE trip's own real span (its first stop's shape
+  // index through its last stop's), so this only ever proposes a point the bus provably drives
+  // past on this exact trip - never a shortcut through unrelated streets.
+  function findInformalPoint(tripId, shapeId, pt){
+    const seq = tripStops[tripId];
+    const pts = shapes[shapeId];
+    if (!seq || !seq.length || !pts || !pts.length) return null;
+    const firstStop = stops[seq[0][0]], lastStop = stops[seq[seq.length-1][0]];
+    if (!firstStop || !lastStop) return null;
+    const spanStart = nearestShapeIndex(shapeId, firstStop.lat, firstStop.lon);
+    const spanEnd = nearestShapeIndexBounded(shapeId, lastStop.lat, lastStop.lon, spanStart, pts.length-1);
+    if (spanEnd <= spanStart) return null;
+    const idx = nearestShapeIndexBounded(shapeId, pt.lat, pt.lon, spanStart, spanEnd);
+    const p = pts[idx];
+    const dist = haversine(pt.lat, pt.lon, p[0], p[1]);
+    if (dist > SEARCH_CONFIG.INFORMAL_STOP_MAX_M) return null;
+    return { lat:p[0], lon:p[1], dist };
+  }
+
+  // swaps in a closer informal boarding/alighting point (see findInformalPoint) when it beats the
+  // officially-chosen GTFS stop's walk by a meaningful margin - called before the walkA/walkB-
+  // dependent timing math in both resolveTransferGroup and the direct-trip resolver, so the
+  // shorter walk is reflected everywhere (ranking, ETA, map) consistently, not just in the label.
+  function applyInformalConnections(g){
+    if (originPoint){
+      const impO = findImportedPointAt(originPoint.lat, originPoint.lon);
+      const firstLeg = g.legs[0];
+      if (impO && firstLeg && firstLeg.tripId){
+        const found = findInformalPoint(firstLeg.tripId, firstLeg.shapeId, impO);
+        if (found && found.dist < g.walkA){
+          g.walkA = found.dist;
+          g.informalBoard = { lat: found.lat, lon: found.lon };
+        }
+      }
+    }
+    if (destPoint){
+      const impD = findImportedPointAt(destPoint.lat, destPoint.lon);
+      const lastLeg = g.legs[g.legs.length-1];
+      if (impD && lastLeg && lastLeg.tripId){
+        const found = findInformalPoint(lastLeg.tripId, lastLeg.shapeId, impD);
+        if (found && found.dist < g.walkB){
+          g.walkB = found.dist;
+          g.informalAlight = { lat: found.lat, lon: found.lon };
+        }
+      }
+    }
+  }
 
   const WEEKDAY_ABBR = ['seg','ter','qua','qui','sex','sáb','dom'];
   const WALK_SPEED_MPS = 1.25; // ~4.5 km/h, ritmo médio de caminhada
@@ -1042,6 +1112,11 @@
     MAX_REASONABLE_WALK_M: 5000,   // se a parada mais próxima da origem OU do destino estiver além disso,
                                     // recusamos a busca com uma mensagem clara em vez de devolver um
                                     // itinerário com um trecho de caminhada de vários km como se fosse normal
+    INFORMAL_STOP_MAX_M: 250,      // se um ponto importado estiver a até essa distância do trajeto real
+                                    // de uma viagem específica (dentro do trecho que ela de fato percorre),
+                                    // oferece embarque/desembarque ali em vez de forçar caminhada até a
+                                    // parada oficial mais próxima - útil quando o GTFS não inclui todas as
+                                    // paradas reais do operador (ver notas de fechamento do app)
     WALK_FREE_MINUTES: 12,         // quanto de caminhada total (embarque + desembarque) o ranking aceita
                                     // "de graça" antes de penalizar - abaixo disso não faz diferença no score
     WALK_PENALTY_PER_MIN: 2,       // penalidade no ranking por minuto de caminhada além do WALK_FREE_MINUTES -
@@ -1223,8 +1298,8 @@
               g = groups[key] = {
                 numTransfers: 1,
                 legs: [
-                  { routeId:l1.route, routeShort:r1?r1.s:'?', routeLong:r1?r1.l:'', headsign:l1.headsign, shapeId:l1.shapeId, boardStop:l1.boardStop, alightStop:transferStopId },
-                  { routeId:l2.route, routeShort:r2?r2.s:'?', routeLong:r2?r2.l:'', headsign:l2.headsign, shapeId:l2.shapeId, boardStop:boardStopId2, alightStop:l2.alightStop }
+                  { routeId:l1.route, routeShort:r1?r1.s:'?', routeLong:r1?r1.l:'', headsign:l1.headsign, shapeId:l1.shapeId, tripId:l1.tripId, boardStop:l1.boardStop, alightStop:transferStopId },
+                  { routeId:l2.route, routeShort:r2?r2.s:'?', routeLong:r2?r2.l:'', headsign:l2.headsign, shapeId:l2.shapeId, tripId:l2.tripId, boardStop:boardStopId2, alightStop:l2.alightStop }
                 ],
                 transfers: [ { atStop: transferStopId, atStop2: boardStopId2, walkM: interWalkM } ],
                 boardStop: l1.boardStop, alightStop: l2.alightStop,
@@ -1345,9 +1420,9 @@
                     g = groups[key] = {
                       numTransfers: 2,
                       legs: [
-                        { routeId:l1.route, routeShort:r1?r1.s:'?', routeLong:r1?r1.l:'', headsign:l1.headsign, shapeId:l1.shapeId, boardStop:l1.boardStop, alightStop:midStop },
-                        { routeId:l2.route, routeShort:r2?r2.s:'?', routeLong:r2?r2.l:'', headsign:l2.headsign, shapeId:l2.shapeId, boardStop:boardStopId2, alightStop:stopId3 },
-                        { routeId:l3.route, routeShort:r3?r3.s:'?', routeLong:r3?r3.l:'', headsign:l3.headsign, shapeId:l3.shapeId, boardStop:boardStopId3, alightStop:l3.alightStop }
+                        { routeId:l1.route, routeShort:r1?r1.s:'?', routeLong:r1?r1.l:'', headsign:l1.headsign, shapeId:l1.shapeId, tripId:l1.tripId, boardStop:l1.boardStop, alightStop:midStop },
+                        { routeId:l2.route, routeShort:r2?r2.s:'?', routeLong:r2?r2.l:'', headsign:l2.headsign, shapeId:l2.shapeId, tripId:l2.tripId, boardStop:boardStopId2, alightStop:stopId3 },
+                        { routeId:l3.route, routeShort:r3?r3.s:'?', routeLong:r3?r3.l:'', headsign:l3.headsign, shapeId:l3.shapeId, tripId:l3.tripId, boardStop:boardStopId3, alightStop:l3.alightStop }
                       ],
                       transfers: [
                         { atStop: midStop, atStop2: boardStopId2, walkM: interWalkM1 },
@@ -1378,6 +1453,7 @@
   // full explainable breakdown: per-leg ride time, per-transfer wait (walk-adjusted), total
   // walking, and estimated arrival - used identically regardless of leg count.
   function resolveTransferGroup(g, dateStr, selTime, searchDT){
+    applyInformalConnections(g);
     const walkMinA = g.walkA / WALK_SPEED_MPS / 60;
     const adj = addMinutesToDateTime(dateStr, selTime, walkMinA);
     g.occurrences = nextOccurrencesChain(g.combos, adj.dateStr, adj.timeStr, 3, SEARCH_CONFIG.OCCURRENCE_HORIZON_DAYS);
@@ -1519,7 +1595,7 @@
           if (!g){
             g = groups[key] = {
               numTransfers: 0, routes: [trip.r],
-              legs: [{ routeId:trip.r, routeShort: route?route.s:'?', routeLong: route?route.l:'', headsign: trip.h, shapeId: trip.sh, boardStop:oc.id, alightStop:dc.id }],
+              legs: [{ routeId:trip.r, routeShort: route?route.s:'?', routeLong: route?route.l:'', headsign: trip.h, shapeId: trip.sh, tripId, boardStop:oc.id, alightStop:dc.id }],
               transfers: [],
               boardStop:oc.id, alightStop:dc.id, walkA:oc.dist, walkB:dc.dist, numStops: seqB-seqA,
               timesRaw: []
@@ -1535,6 +1611,7 @@
 
     const groupList = Object.values(groups);
     groupList.forEach(g => {
+      applyInformalConnections(g);
       const walkMinA = g.walkA / WALK_SPEED_MPS / 60;
       const adj = addMinutesToDateTime(dateStr, selTime, walkMinA);
       g.occurrences = nextOccurrences(g.timesRaw, adj.dateStr, adj.timeStr, 3, SEARCH_CONFIG.OCCURRENCE_HORIZON_DAYS);
@@ -1679,7 +1756,9 @@
       const headsigns = g.legs.map(leg => escapeHtml(leg.headsign || leg.routeLong)).join(' → ');
 
       const metaLines = [];
-      metaLines.push('<span>até <b>' + escapeHtml(stops[g.boardStop].n) + '</b> · <span class="num">' + fmtDist(g.walkA) + '</span> a pé</span>');
+      metaLines.push(g.informalBoard
+        ? '<span>até <b>ponto real próximo ao trajeto</b> <span class="estimate-note">(fora do GTFS)</span> · <span class="num">' + fmtDist(g.walkA) + '</span> a pé</span>'
+        : '<span>até <b>' + escapeHtml(stops[g.boardStop].n) + '</b> · <span class="num">' + fmtDist(g.walkA) + '</span> a pé</span>');
       g.transfers.forEach((tr,i) => {
         const waitMin = Math.round(g.transferWaitMinutes ? g.transferWaitMinutes[i] : 0);
         const sameStop = tr.atStop2 === tr.atStop;
@@ -1689,7 +1768,9 @@
           ' · ~<span class="num">' + waitMin + '</span> min de espera <span class="estimate-note">(estimativa)</span></span>'
         );
       });
-      metaLines.push('<span>de <b>' + escapeHtml(stops[g.alightStop].n) + '</b> · <span class="num">' + fmtDist(g.walkB) + '</span> a pé</span>');
+      metaLines.push(g.informalAlight
+        ? '<span>de <b>ponto real próximo ao trajeto</b> <span class="estimate-note">(fora do GTFS)</span> · <span class="num">' + fmtDist(g.walkB) + '</span> a pé</span>'
+        : '<span>de <b>' + escapeHtml(stops[g.alightStop].n) + '</b> · <span class="num">' + fmtDist(g.walkB) + '</span> a pé</span>');
       // "baldeação" here means only the physical vehicle change - this feed has no fare_rules/
       // fare_attributes, so we never know (and must never imply) whether there's a fare discount
       // or free transfer between these lines ("integração tarifária") - that's a separate question
@@ -1751,14 +1832,28 @@
   function drawItineraryUnified(g){
     clearPreview();
     routeLayer.clearLayers();
-    const boardS = stops[g.boardStop], alightS = stops[g.alightStop];
+    // an informal board/alight point (see applyInformalConnections) isn't a walk-graph node, so
+    // there's no real street path to draw for its walk leg - a straight dashed line is used
+    // instead, consistent with how every other estimate (inter-platform walk, etc.) is drawn here
+    const boardPt = g.informalBoard || stops[g.boardStop];
+    const alightPt = g.informalAlight || stops[g.alightStop];
     const boundsPts = [[originPoint.lat,originPoint.lon],[destPoint.lat,destPoint.lon]];
 
-    const walkA = walkDistAndPath(lastOriginWalk, lastOriginNode, boardS.node, [originPoint.lat,originPoint.lon], [boardS.lat,boardS.lon]);
-    const walkBraw = walkDistAndPath(lastDestWalk, lastDestNode, alightS.node, [destPoint.lat,destPoint.lon], [alightS.lat,alightS.lon]);
-    const walkBPts = walkBraw.path.slice().reverse(); // lastDestWalk runs FROM destNode; flip to alight->destination order
-    const walkAPts = (walkA.path && walkA.path.length>=2) ? walkA.path : [[originPoint.lat,originPoint.lon],[boardS.lat,boardS.lon]];
-    const walkBFull = (walkBPts && walkBPts.length>=2) ? walkBPts : [[alightS.lat,alightS.lon],[destPoint.lat,destPoint.lon]];
+    let walkAPts;
+    if (g.informalBoard){
+      walkAPts = [[originPoint.lat,originPoint.lon],[boardPt.lat,boardPt.lon]];
+    } else {
+      const walkA = walkDistAndPath(lastOriginWalk, lastOriginNode, boardPt.node, [originPoint.lat,originPoint.lon], [boardPt.lat,boardPt.lon]);
+      walkAPts = (walkA.path && walkA.path.length>=2) ? walkA.path : [[originPoint.lat,originPoint.lon],[boardPt.lat,boardPt.lon]];
+    }
+    let walkBFull;
+    if (g.informalAlight){
+      walkBFull = [[alightPt.lat,alightPt.lon],[destPoint.lat,destPoint.lon]];
+    } else {
+      const walkBraw = walkDistAndPath(lastDestWalk, lastDestNode, alightPt.node, [destPoint.lat,destPoint.lon], [alightPt.lat,alightPt.lon]);
+      const walkBPts = walkBraw.path.slice().reverse(); // lastDestWalk runs FROM destNode; flip to alight->destination order
+      walkBFull = (walkBPts && walkBPts.length>=2) ? walkBPts : [[alightPt.lat,alightPt.lon],[destPoint.lat,destPoint.lon]];
+    }
     L.polyline(walkAPts, { color:'var(--origin)', weight:2.2, dashArray:'1,7', lineCap:'round', lineJoin:'round', opacity:0.9 }).addTo(routeLayer);
     L.polyline(walkBFull, { color:'var(--dest)', weight:2.2, dashArray:'1,7', lineCap:'round', lineJoin:'round', opacity:0.9 }).addTo(routeLayer);
     boundsPts.push(...walkAPts, ...walkBFull);
@@ -1773,16 +1868,18 @@
       boundsPts.push(...pts);
     });
 
-    // each leg's ride, in its own color
+    // each leg's ride, in its own color - the first/last leg rides all the way to the informal
+    // point when one applies, instead of stopping at the officially-listed stop
     g.legs.forEach((leg, i) => {
-      const fromS = stops[leg.boardStop], toS = stops[leg.alightStop];
-      const ridePts = trimShape(leg.shapeId, fromS.lat, fromS.lon, toS.lat, toS.lon);
+      const fromPt = (i===0 && g.informalBoard) ? boardPt : stops[leg.boardStop];
+      const toPt = (i===g.legs.length-1 && g.informalAlight) ? alightPt : stops[leg.alightStop];
+      const ridePts = trimShape(leg.shapeId, fromPt.lat, fromPt.lon, toPt.lat, toPt.lon);
       L.polyline(ridePts, { color: LEG_RIDE_COLOR[i]||'var(--accent)', weight:4.5, lineCap:'round', lineJoin:'round' }).addTo(routeLayer);
       boundsPts.push(...ridePts);
     });
 
     const dotR = 6;
-    L.circleMarker([boardS.lat,boardS.lon], { radius:dotR, weight:2, color:'var(--surface)', fillColor:'var(--accent)', fillOpacity:1 }).addTo(routeLayer);
+    L.circleMarker([boardPt.lat,boardPt.lon], { radius:dotR, weight:2, color:'var(--surface)', fillColor:'var(--accent)', fillOpacity:1 }).addTo(routeLayer);
     g.transfers.forEach((tr,i) => {
       const sA = stops[tr.atStop], sB = stops[tr.atStop2];
       L.circleMarker([sA.lat,sA.lon], { radius:dotR*0.85, weight:2, color: LEG_RIDE_COLOR[i], fillColor:'var(--surface)', fillOpacity:1 }).addTo(routeLayer);
@@ -1790,7 +1887,7 @@
         L.circleMarker([sB.lat,sB.lon], { radius:dotR*0.85, weight:2, color: LEG_RIDE_COLOR[i+1], fillColor:'var(--surface)', fillOpacity:1 }).addTo(routeLayer);
       }
     });
-    L.circleMarker([alightS.lat,alightS.lon], { radius:dotR, weight:2, color:'var(--surface)', fillColor:'var(--dest)', fillOpacity:1 }).addTo(routeLayer);
+    L.circleMarker([alightPt.lat,alightPt.lon], { radius:dotR, weight:2, color:'var(--surface)', fillColor:'var(--dest)', fillOpacity:1 }).addTo(routeLayer);
 
     map.fitBounds(L.latLngBounds(boundsPts), { padding:[36,36], maxZoom:17 });
   }
