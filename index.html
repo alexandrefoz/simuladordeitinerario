@@ -229,7 +229,17 @@
   ::-webkit-scrollbar-thumb{background:var(--border);border-radius:8px}
 
   @media (max-width:640px){
-    .panel{width:calc(100vw - 24px);top:10px;left:10px;max-height:min(66vh, calc(100vh - 20px))}
+    /* on a phone, a left-docked 380px card leaves almost no usable map - since this app's core
+       interaction is tapping the map to set origin/destination, the panel becomes a bottom sheet
+       instead (like Google/Apple Maps): full width, docked to the bottom, capped shorter so the
+       map stays visible and tappable above it. map-controls/map-caption move up to the top edge
+       so the sheet doesn't cover them (they're normally bottom-anchored). */
+    .panel{
+      width:100%;max-width:100%;top:auto;left:0;right:0;bottom:0;
+      border-radius:16px 16px 0 0;max-height:min(52vh, calc(100vh - 20px));
+    }
+    .map-controls{bottom:auto;top:14px}
+    .map-caption{bottom:auto;top:14px}
   }
 </style>
 </head>
@@ -722,11 +732,16 @@
   document.getElementById('timeInput').value = now.toTimeString().slice(0,5);
 
   // ---------------- routing ----------------
-  function nearestShapeIndex(shapeId, lat, lon){
+  // minIndex restricts the search to points at or after it - needed by trimShape below so a
+  // looping/self-intersecting shape (common on "alimentadora" feeder routes, which circle through
+  // a neighborhood) can't snap the alighting point to an EARLIER pass through a spot the route
+  // revisits, which would draw the ride ending at the wrong place on the map.
+  function nearestShapeIndex(shapeId, lat, lon, minIndex){
     const pts = shapes[shapeId];
     if (!pts) return 0;
-    let best=0, bestD=Infinity;
-    for (let i=0;i<pts.length;i++){
+    const start = minIndex || 0;
+    let best=start, bestD=Infinity;
+    for (let i=start;i<pts.length;i++){
       const d = haversine(lat,lon,pts[i][0],pts[i][1]);
       if (d<bestD){ bestD=d; best=i; }
     }
@@ -766,6 +781,13 @@
     MAX_REASONABLE_WALK_M: 5000,   // se a parada mais próxima da origem OU do destino estiver além disso,
                                     // recusamos a busca com uma mensagem clara em vez de devolver um
                                     // itinerário com um trecho de caminhada de vários km como se fosse normal
+    WALK_FREE_MINUTES: 12,         // quanto de caminhada total (embarque + desembarque) o ranking aceita
+                                    // "de graça" antes de penalizar - abaixo disso não faz diferença no score
+    WALK_PENALTY_PER_MIN: 2,       // penalidade no ranking por minuto de caminhada além do WALK_FREE_MINUTES -
+                                    // sem isso, o ranking só olhava chegada e preferia qualquer caminhada por
+                                    // menor que fosse a economia de tempo; isso não impede uma opção só de
+                                    // muita caminhada de aparecer (ela pode ainda ser a única/melhor), só evita
+                                    // que ela vença uma alternativa parecida com bem menos caminhada
     RESULT_COUNT: 6,
     MAX_PER_ROUTE: 2,
     OCCURRENCE_HORIZON_DAYS: 14
@@ -1319,9 +1341,13 @@
     function itineraryScore(g){
       const arrivalMin = (g.arrivalDT - searchDT) / 60000;
       const extraWait = Math.max(0, (g.totalWaitMinutes||0) - g.numTransfers*SEARCH_CONFIG.TRANSFER_MIN_MINUTES);
+      const totalWalkM = g.walkA + g.walkB + (g.transfers||[]).reduce((s,t)=>s+(t.walkM||0),0);
+      const totalWalkMin = totalWalkM / WALK_SPEED_MPS / 60;
+      const extraWalk = Math.max(0, totalWalkMin - SEARCH_CONFIG.WALK_FREE_MINUTES);
       return arrivalMin
         + g.numTransfers*SEARCH_CONFIG.TRANSFER_COUNT_PENALTY_MIN
-        + extraWait*SEARCH_CONFIG.TRANSFER_WAIT_PENALTY_PER_MIN;
+        + extraWait*SEARCH_CONFIG.TRANSFER_WAIT_PENALTY_PER_MIN
+        + extraWalk*SEARCH_CONFIG.WALK_PENALTY_PER_MIN;
     }
     combined.forEach(g => { g.score = itineraryScore(g); });
     combined.sort((a,b) => a.score - b.score);
@@ -1444,9 +1470,10 @@
     const pts = shapes[shapeId];
     let ridePts = [[fromLat,fromLon],[toLat,toLon]];
     if (pts && pts.length>1){
-      let i1 = nearestShapeIndex(shapeId, fromLat, fromLon);
-      let i2 = nearestShapeIndex(shapeId, toLat, toLon);
-      if (i1>i2){ const t=i1; i1=i2; i2=t; }
+      // a bus moves forward along its shape, never backward, so the alighting point is searched
+      // for ONLY from the boarding point onward - this is what makes loop routes resolve correctly
+      const i1 = nearestShapeIndex(shapeId, fromLat, fromLon);
+      const i2 = nearestShapeIndex(shapeId, toLat, toLon, i1);
       ridePts = pts.slice(i1,i2+1);
       if (ridePts.length<2) ridePts=[[fromLat,fromLon],[toLat,toLon]];
     }
