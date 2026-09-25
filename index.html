@@ -83,6 +83,37 @@
   }
   .pin-dot span{color:#fff;font:700 11px var(--font-display)}
 
+  .stop-popup-wrap .leaflet-popup-content-wrapper{background:var(--surface);color:var(--ink);border-radius:10px;box-shadow:var(--shadow)}
+  .stop-popup-wrap .leaflet-popup-tip{background:var(--surface)}
+  .stop-popup{font-family:var(--font-body);min-width:180px}
+  .stop-popup b{font-size:13px;font-family:var(--font-display)}
+  .stop-popup-label{margin:8px 0 4px;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-dim)}
+  .stop-popup-lines{display:flex;flex-wrap:wrap;gap:4px}
+  .stop-popup-chip{
+    font-family:var(--font-mono);font-size:11px;font-weight:600;color:var(--accent-ink);
+    background:color-mix(in srgb, var(--accent) 16%, transparent);padding:2px 7px;border-radius:20px;
+  }
+  .stop-popup-empty{font-size:11px;color:var(--ink-dim);margin:4px 0 0}
+  .stop-popup-actions{display:flex;gap:6px;margin-top:10px}
+  .stop-popup-actions button{
+    flex:1;font-family:var(--font-display);font-size:11.5px;font-weight:600;cursor:pointer;
+    border:1px solid var(--border);border-radius:7px;padding:6px 4px;background:var(--surface-2);color:var(--ink);
+  }
+  .stop-popup-actions button:hover{border-color:var(--accent);color:var(--accent-ink)}
+  .stop-popup-actions button[data-stop-action="origin"]{border-left:3px solid var(--origin)}
+  .stop-popup-actions button[data-stop-action="dest"]{border-left:3px solid var(--dest)}
+
+  /* diamond shape (square rotated 45deg) visually distinguishes an imported point from both a
+     round GTFS stop dot and the lettered A/B origin/destination pins - not a bus stop, so it
+     deliberately doesn't look like one */
+  .imported-dot{
+    width:11px;height:11px;background:var(--accent2);border:2px solid var(--surface);
+    transform:rotate(45deg);box-shadow:var(--shadow);
+  }
+  .imported-connection{margin:2px 0 0;font-size:11px}
+  .imported-connection b{color:var(--ink);font-weight:600}
+  .imported-connection .num{font-family:var(--font-mono);font-variant-numeric:tabular-nums}
+
   .map-caption{
     position:absolute;left:14px;bottom:12px;font-size:11px;color:var(--ink-dim);
     background:color-mix(in srgb, var(--surface) 82%, transparent);
@@ -162,6 +193,12 @@
     padding:11px 14px;font-size:13px;font-weight:600;cursor:pointer;font-family:var(--font-display);
   }
   .btn-secondary:hover{color:var(--ink);border-color:var(--ink-dim)}
+
+  .kml-import{display:flex;flex-direction:column;gap:3px;margin-top:-4px}
+  .kml-import-row{display:flex;align-items:center;gap:10px;flex-wrap:wrap}
+  .kml-import .btn-secondary{padding:7px 11px;font-size:11.5px}
+  .kml-toggle{display:flex;align-items:center;gap:5px;font-size:11px;color:var(--ink-dim);cursor:pointer}
+  .kml-toggle input{margin:0}
 
   .status-msg{
     font-size:11.5px;padding:8px 10px;border-radius:8px;
@@ -297,6 +334,17 @@
     <div class="btn-row">
       <button class="btn-primary" id="searchBtn" type="button">Buscar itinerário</button>
       <button class="btn-secondary" id="clearBtn" type="button" title="Limpar busca" aria-label="Limpar busca">Limpar</button>
+    </div>
+
+    <div class="kml-import">
+      <div class="kml-import-row">
+        <input type="file" id="kmlFileInput" accept=".kml" hidden>
+        <button class="btn-secondary" id="kmlImportBtn" type="button">Importar pontos (.kml)</button>
+        <label class="kml-toggle" id="kmlToggleWrap" hidden>
+          <input type="checkbox" id="kmlLayerToggle" checked> mostrar no mapa
+        </label>
+      </div>
+      <p class="stop-hint" id="kmlImportStatus"></p>
     </div>
 
     <div id="statusArea"></div>
@@ -527,12 +575,17 @@
     return null;
   }
 
-  // resolves free text to a place: exact "Nome — Categoria" POI pick, exact/partial stop name,
-  // then exact/partial POI name (for when someone types the place without the category suffix)
+  // resolves free text to a place: exact "Nome — Categoria" POI pick or "Nome (importado)" pick,
+  // exact/partial stop name, then exact/partial POI or imported-point name (for when someone types
+  // the place without the category/import suffix)
   function resolveLocation(raw){
     if (poiByDisplay.has(raw)){
       const p = poiByDisplay.get(raw);
       return { lat: p.lat, lon: p.lon, label: p.n };
+    }
+    if (importedByDisplay.has(raw)){
+      const p = importedByDisplay.get(raw);
+      return { lat: p.lat, lon: p.lon, label: p.name };
     }
     const stopId = findStopByName(raw);
     if (stopId) return { lat: stops[stopId].lat, lon: stops[stopId].lon, label: stops[stopId].n };
@@ -541,9 +594,168 @@
       let poi = pois.find(p => normalize(p.n) === n);
       if (!poi) poi = pois.find(p => normalize(p.n).includes(n));
       if (poi) return { lat: poi.lat, lon: poi.lon, label: poi.n };
+      let imp = importedPoints.find(p => normalize(p.name) === n);
+      if (!imp) imp = importedPoints.find(p => normalize(p.name).includes(n));
+      if (imp) return { lat: imp.lat, lon: imp.lon, label: imp.name };
     }
     return null;
   }
+
+  // ---------------- imported KML points (user-supplied, separate from GTFS stops) ----------------
+  // KML carries no routes/trips/schedule, so these are never treated as bus-served stops - when one
+  // is picked as origin/destination it's handed to setOrigin/setDest exactly like a map click or POI
+  // pick, so the existing candidateStops + real walking-graph connection to a GTFS stop (and the
+  // "fora da área de cobertura" refusal in search() if nothing reasonable is nearby) apply unchanged.
+  const IMPORTED_DUPLICATE_RADIUS_M = 30; // an imported point this close to an existing GTFS stop
+                                           // (or another already-imported point) is treated as a
+                                           // duplicate and skipped, not drawn as a second marker
+  let importedPoints = []; // { id, name, lat, lon }
+  let importedNextId = 1;
+  const importedByDisplay = new Map();
+  const importedLayer = L.layerGroup();
+
+  function parseKML(text){
+    const out = { points: [], errors: [], skippedNonPoint: 0 };
+    let xml;
+    try {
+      xml = new DOMParser().parseFromString(text, 'application/xml');
+    } catch(e){
+      out.errors.push('Não foi possível ler o arquivo como XML.');
+      return out;
+    }
+    if (!xml || xml.querySelector('parsererror')){
+      out.errors.push('Arquivo KML malformado (XML inválido).');
+      return out;
+    }
+    const placemarks = xml.querySelectorAll('Placemark');
+    if (placemarks.length === 0){
+      out.errors.push('Nenhum Placemark encontrado no arquivo.');
+      return out;
+    }
+    placemarks.forEach((pm, i) => {
+      const pointEl = pm.querySelector('Point');
+      if (!pointEl){
+        if (pm.querySelector('LineString, Polygon, MultiGeometry, LinearRing')) out.skippedNonPoint++;
+        return;
+      }
+      const coordsEl = pointEl.querySelector('coordinates');
+      const raw = coordsEl ? coordsEl.textContent.trim() : '';
+      if (!raw){
+        out.errors.push('Placemark #' + (i+1) + ' sem coordenadas.');
+        return;
+      }
+      // KML order is lon,lat[,alt] - altitude is optional and ignored (2D routing/display only)
+      const parts = raw.split(',').map(s => parseFloat(s.trim()));
+      const lon = parts[0], lat = parts[1];
+      if (!Number.isFinite(lon) || !Number.isFinite(lat) || lat < -90 || lat > 90 || lon < -180 || lon > 180){
+        out.errors.push('Placemark #' + (i+1) + ' com coordenadas inválidas: "' + raw + '".');
+        return;
+      }
+      const nameEl = pm.querySelector('name');
+      const name = (nameEl && nameEl.textContent.trim()) || ('Ponto importado ' + (i+1));
+      out.points.push({ name, lat, lon });
+    });
+    return out;
+  }
+
+  function nearestExistingDist(lat, lon){
+    let best = Infinity;
+    stopIds.forEach(id => { const d = haversine(lat,lon,stops[id].lat,stops[id].lon); if (d<best) best=d; });
+    importedPoints.forEach(p => { const d = haversine(lat,lon,p.lat,p.lon); if (d<best) best=d; });
+    return best;
+  }
+
+  function importedPopupHtml(pt){
+    const near = nearestStops(pt.lat, pt.lon, 1)[0];
+    let connectionHtml;
+    if (near){
+      const s = stops[near.id];
+      const node = nearestWalkNode(pt.lat, pt.lon);
+      const w = walkDijkstra(node, [s.node]);
+      const r = walkDistAndPath(w, node, s.node, [pt.lat,pt.lon], [s.lat,s.lon]);
+      if (r.dist > SEARCH_CONFIG.MAX_REASONABLE_WALK_M){
+        connectionHtml = '<p class="stop-popup-empty">Não foi possível encontrar uma conexão de caminhada razoável até uma parada de ônibus.</p>';
+      } else {
+        const min = Math.round(r.dist / WALK_SPEED_MPS / 60);
+        connectionHtml = '<p class="stop-popup-label">conectado por caminhada a:</p>' +
+          '<p class="imported-connection"><b>' + escapeHtml(s.n) + '</b> · <span class="num">' + fmtDist(r.dist) + '</span> · ~<span class="num">' + min + '</span> min <span class="estimate-note">(estimativa)</span></p>';
+      }
+    } else {
+      connectionHtml = '<p class="stop-popup-empty">Nenhuma parada de ônibus encontrada nesta rede.</p>';
+    }
+    return '<div class="stop-popup">' +
+      '<b>' + escapeHtml(pt.name) + '</b>' +
+      '<p class="stop-popup-empty" style="margin-top:2px">ponto importado — não é uma parada de ônibus</p>' +
+      connectionHtml +
+      '<div class="stop-popup-actions">' +
+        '<button type="button" data-imported-action="origin" data-imported-id="' + pt.id + '">Usar como origem</button>' +
+        '<button type="button" data-imported-action="dest" data-imported-id="' + pt.id + '">Usar como destino</button>' +
+      '</div>' +
+    '</div>';
+  }
+
+  function addImportedMarker(pt){
+    const marker = L.marker([pt.lat, pt.lon], {
+      icon: L.divIcon({ className:'imported-icon', html:'<div class="imported-dot"></div>', iconSize:[14,14], iconAnchor:[7,7] })
+    }).addTo(importedLayer);
+    marker.on('click', (e) => {
+      L.DomEvent.stopPropagation(e);
+      marker.bindPopup(importedPopupHtml(pt), { className:'stop-popup-wrap' }).openPopup();
+    });
+  }
+
+  function importKmlText(text, filename){
+    const parsed = parseKML(text);
+    let added = 0, dupes = 0;
+    parsed.points.forEach(p => {
+      if (nearestExistingDist(p.lat, p.lon) <= IMPORTED_DUPLICATE_RADIUS_M){ dupes++; return; }
+      const id = 'IMP_' + (importedNextId++);
+      const pt = { id, name: p.name, lat: p.lat, lon: p.lon };
+      importedPoints.push(pt);
+      const display = p.name + ' (importado)';
+      importedByDisplay.set(display, pt);
+      const opt = document.createElement('option');
+      opt.value = display;
+      datalist.appendChild(opt);
+      addImportedMarker(pt);
+      added++;
+    });
+    const msgParts = [];
+    msgParts.push(added + ' ponto' + (added!==1?'s':'') + ' importado' + (added!==1?'s':'') + (filename ? ' de "' + escapeHtml(filename) + '"' : ''));
+    if (dupes) msgParts.push(dupes + ' ignorado' + (dupes!==1?'s':'') + ' por já existir uma parada muito próxima');
+    if (parsed.skippedNonPoint) msgParts.push(parsed.skippedNonPoint + ' elemento(s) sem geometria de ponto ignorado(s)');
+    if (parsed.errors.length) msgParts.push(parsed.errors.length + ' com erro de formato/coordenadas (ignorados)');
+    document.getElementById('kmlImportStatus').innerHTML = msgParts.join(' · ');
+    if (added > 0){
+      document.getElementById('kmlToggleWrap').hidden = false;
+      if (!map.hasLayer(importedLayer)) map.addLayer(importedLayer);
+    }
+    return { added, dupes, errors: parsed.errors, skippedNonPoint: parsed.skippedNonPoint };
+  }
+
+  document.getElementById('kmlImportBtn').addEventListener('click', () => {
+    document.getElementById('kmlFileInput').click();
+  });
+  document.getElementById('kmlFileInput').addEventListener('change', (e) => {
+    const file = e.target.files && e.target.files[0];
+    if (!file) return;
+    if (!/\.kml$/i.test(file.name)){
+      document.getElementById('kmlImportStatus').textContent = 'Arquivo ignorado: selecione um arquivo .kml.';
+      e.target.value = '';
+      return;
+    }
+    const reader = new FileReader();
+    reader.onload = () => { importKmlText(String(reader.result||''), file.name); e.target.value = ''; };
+    reader.onerror = () => { document.getElementById('kmlImportStatus').textContent = 'Não foi possível ler o arquivo.'; e.target.value = ''; };
+    reader.readAsText(file);
+  });
+  document.getElementById('kmlLayerToggle').addEventListener('change', (e) => {
+    if (e.target.checked) map.addLayer(importedLayer);
+    else map.removeLayer(importedLayer);
+  });
+  // the popupPane click delegation that handles this button (data-imported-action) is registered
+  // once, further down, alongside the equivalent one for GTFS stop popups (data-stop-action) -
+  // map doesn't exist yet at this point in the script, so it can't be wired up here
 
   // accepts a pasted Google Maps link or a raw "lat, lon" pair and extracts coordinates.
   // short links (maps.app.goo.gl, goo.gl/maps) can't be resolved here - they need a live network
@@ -582,12 +794,61 @@
   }).addTo(map);
 
   // ---------------- draw stop dots ----------------
+  // clicking a stop shows which lines serve it + lets you use it as origin/destination directly,
+  // instead of only being reachable by clicking blank map (which just resolves to "nearest stop")
+  function stopPopupHtml(id){
+    const s = stops[id];
+    const routeIds = stopRoutes.get(id) || new Set();
+    const shortNames = [...new Set([...routeIds].map(r => (routes[r] && routes[r].s) || '?'))]
+      .sort((a,b) => a.localeCompare(b, 'pt-BR', {numeric:true}));
+    const linesHtml = shortNames.length
+      ? '<div class="stop-popup-lines">' + shortNames.map(n => '<span class="stop-popup-chip">' + escapeHtml(n) + '</span>').join('') + '</div>'
+      : '<p class="stop-popup-empty">Nenhuma linha ativa encontrada pra esta parada nos dados atuais.</p>';
+    return '<div class="stop-popup">' +
+      '<b>' + escapeHtml(s.n) + '</b>' +
+      '<p class="stop-popup-label">linhas que passam aqui:</p>' +
+      linesHtml +
+      '<div class="stop-popup-actions">' +
+        '<button type="button" data-stop-action="origin" data-stop-id="' + id + '">Usar como origem</button>' +
+        '<button type="button" data-stop-action="dest" data-stop-id="' + id + '">Usar como destino</button>' +
+      '</div>' +
+    '</div>';
+  }
   const stopsLayer = L.layerGroup().addTo(map);
   stopIds.forEach(id => {
     const s = stops[id];
-    L.circleMarker([s.lat, s.lon], { radius:2, weight:0, fillColor:'var(--ink-dim)', fillOpacity:0.5 })
+    // a solid dot + light ring reads as a small pin against a busy real-street tile background -
+    // the earlier borderless radius:2 dot at 0.5 opacity nearly disappeared into the map clutter
+    const marker = L.circleMarker([s.lat, s.lon], { radius:3.5, weight:1.5, color:'var(--surface)', fillColor:'var(--ink-dim)', fillOpacity:0.95 })
       .bindTooltip(escapeHtml(s.n), { direction:'top', sticky:true })
       .addTo(stopsLayer);
+    marker.on('click', (e) => {
+      L.DomEvent.stopPropagation(e); // don't also trigger the generic map-click (set origin/dest at this exact point)
+      marker.bindPopup(stopPopupHtml(id), { className:'stop-popup-wrap' }).openPopup();
+    });
+  });
+  // event delegation on the popup pane - popups are recreated per open, so buttons inside them
+  // need a listener that survives that, rather than one bound to a specific (replaced) button
+  map.getPane('popupPane').addEventListener('click', (e) => {
+    const stopBtn = e.target.closest('button[data-stop-action]');
+    if (stopBtn){
+      const s = stops[stopBtn.dataset.stopId];
+      if (s){
+        if (stopBtn.dataset.stopAction === 'origin') setOrigin(s.lat, s.lon, s.n);
+        else setDest(s.lat, s.lon, s.n);
+        map.closePopup();
+      }
+      return;
+    }
+    const impBtn = e.target.closest('button[data-imported-action]');
+    if (impBtn){
+      const pt = importedPoints.find(p => p.id === impBtn.dataset.importedId);
+      if (pt){
+        if (impBtn.dataset.importedAction === 'origin') setOrigin(pt.lat, pt.lon, pt.name);
+        else setDest(pt.lat, pt.lon, pt.name);
+        map.closePopup();
+      }
+    }
   });
 
   function fitToNetwork(){
